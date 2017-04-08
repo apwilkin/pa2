@@ -1,0 +1,394 @@
+#include "../include/simulator.h"
+#include <queue>
+#include <stdio.h>
+#include <string.h>
+#include <iostream>
+#include "stdint.h"
+#include <fstream>
+
+#define CRC16 0x8005
+
+/* ******************************************************************
+ ALTERNATING BIT AND GO-BACK-N NETWORK EMULATOR: VERSION 1.1  J.F.Kurose
+
+   This code should be used for PA2, unidirectional data transfer 
+   protocols (from A to B). Network properties:
+   - one way network delay averages five time units (longer if there
+     are other messages in the channel for GBN), but can be larger
+   - packets can be corrupted (either the header or the data portion)
+     or lost, according to user-defined probabilities
+   - packets will be delivered in the order in which they were sent
+     (although some can be lost).
+**********************************************************************/
+
+/********* STUDENTS WRITE THE NEXT SEVEN ROUTINES *********/
+
+//global variables
+bool next_msg = false;
+bool resend = false;
+bool inflight = false;
+int seqnum;
+int acknum;
+int b_seqnum = 0;
+int b_acknum = 0;
+std::queue<msg> msg_queue;
+
+std::ofstream outputfile;
+
+struct pktBits {
+	uint16_t twoByteSeg[sizeof(pkt)/2];
+};
+
+//Solution from stack overflow: http://stackoverflow.com/questions/10564491/function-to-calculate-a-crc16-checksum
+uint16_t gen_crc16(const uint8_t *data, uint16_t size) {
+	uint16_t out = 0;
+	int bits_read = 0, bit_flag;
+
+	/* Sanity check: */
+	if(data == NULL)
+		return 0;
+
+	while(size > 0)	{
+		bit_flag = out >> 15;
+
+		/* Get next bit: */
+		out <<= 1;
+		out |= (*data >> bits_read) & 1; // item a) work from the least significant bits
+
+		/* Increment bit counter: */
+		bits_read++;
+		if(bits_read > 7)
+		{
+		    bits_read = 0;
+		    data++;
+		    size--;
+		}
+
+		/* Cycle check: */
+		if(bit_flag)
+		    out ^= CRC16;
+
+	}
+
+	// item b) "push out" the last 16 bits
+	int i;
+	for (i = 0; i < 16; ++i) {
+		bit_flag = out >> 15;
+		out <<= 1;
+		if(bit_flag)
+		    out ^= CRC16;
+	}
+
+	// item c) reverse the bits
+	uint16_t crc = 0;
+	i = 0x8000;
+	int j = 0x0001;
+	for (; i != 0; i >>=1, j <<= 1) {
+		if (i & out) crc |= j;
+	}
+
+	return crc;
+}
+//end solution
+
+/* called from layer 5, passed the data to be sent to other side */
+void A_output(struct msg message) {
+
+	//outputfile.open ("output_data.txt", std::ios_base::app);
+	//outputfile << "A_output called\n";
+	
+	
+	uint16_t checksum = 0;
+	struct pkt packet;
+	packet.seqnum = seqnum;
+	packet.acknum = acknum;
+	packet.checksum = checksum;
+	memcpy(packet.payload, message.data, sizeof(message)); // everything good here
+
+	
+	////// Generate checksum: make pkBits, and cast packet to this type ////////
+	
+	
+	/*
+	
+	My solution, did not work
+	
+	struct pktBits *bitsToAdd = (struct pktBits*)&packet;	
+	uint16_t sum = bitsToAdd->twoByteSeg[0];
+
+	outputfile << "(A) BitsToAdd 0:";
+	outputfile << sum;
+	outputfile << "\n";
+	for (int i = 0; i < sizeof(bitsToAdd->twoByteSeg) - 1; i++) {
+		outputfile << "(A) BitsToAdd ";
+		outputfile << i;
+		outputfile << ": ";
+		outputfile << bitsToAdd->twoByteSeg[i];
+		outputfile << "\n";
+		uint16_t next_seg = bitsToAdd->twoByteSeg[i + 1];
+		uint16_t prev_seg = sum;
+		uint16_t carry = 0;		
+		for (int j = 0; j < 16; j++) {
+			uint16_t s = (sum >> j) & 1;
+			uint16_t ns = (next_seg >> j) & 1;
+			uint16_t ps = (prev_seg >> j) & 1;
+			s = ((ns ^ ps) ^ carry); // sum
+			sum = sum | (s << j);
+			carry = ((ns & ps) | (ns & carry)) | (ps & carry); // carry
+		}
+		sum += carry;
+	}
+	~sum;
+	
+	end solution
+	
+	*/
+	
+	int sum = gen_crc16((uint8_t*)&packet, sizeof(packet));
+	
+	
+	//////////////////////////////////// end checksum ///////////////////////////
+	
+	
+	
+	
+	packet.checksum = sum;
+	//outputfile << "A side checksum: ";
+	//outputfile << packet.checksum;
+	//outputfile << "\n";
+	//outputfile.close();
+
+	
+	// if this is a resend (due to timeout/corruption) or if it is a queued message
+	// there is no need to add to the queue	
+	if (resend || next_msg) {
+	
+		//outputfile.open ("output_data.txt", std::ios_base::app);
+		//outputfile << "Resend/next message: ";
+		//outputfile << *message.data;
+		//outputfile << "\n";
+		//outputfile.close();
+		
+		resend = false;
+		next_msg = false;
+		inflight = true;
+		tolayer3(0, packet);//send it out boys!
+		starttimer(0, 20);
+	}
+	else {
+		msg_queue.push(message);//cleaned up here
+		if (inflight) {
+			//outputfile.open ("output_data.txt", std::ios_base::app);
+			//outputfile << "Packet in flight, wait...\n";
+			//outputfile.close();
+			return;
+		}
+		else {
+			/*outputfile.open ("output_data.txt", std::ios_base::app);
+			outputfile << "Message sent: ";
+			outputfile << *message.data;
+			outputfile << "\n";
+			outputfile << "Acknum sent: ";
+			outputfile << packet.acknum;
+			outputfile << "\n";
+			outputfile << "Seqnum sent: ";
+			outputfile << packet.seqnum;
+			outputfile << "\n";
+			outputfile << "Checksum sent: ";
+			outputfile << packet.checksum;
+			outputfile << "\n";
+			outputfile << "(A) pkt data: ";
+			outputfile << "\n";
+			for (int i = 0; i < sizeof(struct pkt)/2; i++) {
+				outputfile << *(((uint16_t*)&packet) + i);
+				outputfile << "\n";
+			}
+			outputfile.close();*/
+			inflight = true;
+			tolayer3(0, packet);
+			starttimer(0, 20);
+		}
+	}
+}
+
+/* called from layer 3, when a packet arrives for layer 4 */
+void A_input(struct pkt packet) {
+
+	/*outputfile.open ("output_data.txt", std::ios_base::app);
+	outputfile << "A_input called\n";
+	outputfile.close();*/
+	
+	//is this the most recent packet?
+	if (packet.acknum == acknum && packet.seqnum == seqnum){
+		/*outputfile.open ("output_data.txt", std::ios_base::app);
+		outputfile << "Transmission successful?\n";
+		outputfile.close();*/
+		
+		stoptimer(0);
+		inflight = false;
+		
+		if (seqnum == 0) { seqnum = 1;}
+		else { seqnum = 0;}
+		
+		if (acknum == 0) { acknum = 1;}
+		else { acknum = 0;}
+		
+		msg_queue.pop();
+		if (!(msg_queue.empty())) {
+			next_msg = true;
+			A_output(msg_queue.front());
+		}
+	}
+}
+
+/* called when A's timer goes off */
+void A_timerinterrupt() {
+	resend = true;
+	A_output(msg_queue.front());
+}  
+
+/* the following routine will be called once (only) before any other */
+/* entity A routines are called. You can use it to do any initialization */
+void A_init(){
+	/*outputfile.open ("output_data.txt");
+	outputfile << "~~~~~~~~~~~~~~~~~ A_init called ~~~~~~~~~~~~~~~~~~~~~~\n";
+	outputfile.close();*/
+	seqnum = 0;
+	acknum = 0;
+}
+
+/* Note that with simplex transfer from a-to-B, there is no B_output() */
+
+/* called from layer 3, when a packet arrives for layer 4 at B*/
+void B_input(struct pkt packet) {
+	//do checksum check
+	
+	
+	/*outputfile.open ("output_data.txt", std::ios_base::app);
+	outputfile << "B_input called\n";
+	outputfile << "Message received: ";
+	outputfile << *packet.payload;
+	outputfile << "\n";
+	outputfile << "Acknum received: ";
+	outputfile << packet.acknum;
+	outputfile << "\n";
+	outputfile << "Seqnum received: ";
+	outputfile << packet.seqnum;
+	outputfile << "\n";
+	outputfile << "Checksum received: ";
+	outputfile << packet.checksum;
+	outputfile << "\n";
+	
+	outputfile << "(B) pkt data: ";
+	outputfile << "\n";
+	for (int i = 0; i < sizeof(struct pkt)/2; i++) {
+		outputfile << *(((uint16_t*)&packet) + i);
+		outputfile << "\n";
+	}*/	
+	
+	uint16_t a_checksum = packet.checksum;
+	
+	uint16_t reset = 0;
+	packet.checksum = reset;	
+	/*outputfile << "Checksum reset: ";
+	outputfile << packet.checksum;
+	outputfile << "\n";*/
+	
+	
+
+	/*struct pktBits *bitsToAdd = (struct pktBits*)&packet;
+	
+	
+	for (int i = 0; i < sizeof(bitsToAdd->twoByteSeg); i++) {
+		result += bitsToAdd->twoByteSeg[i]; // this does not seem to work...
+	}
+	
+	
+	uint16_t sum = bitsToAdd->twoByteSeg[0];
+	uint16_t carry = 0;
+	
+	for(int i = 0; i < sizeof(bitsToAdd->twoByteSeg) - 1;  i++) {
+		sum = (sum ^ bitsToAdd->twoByteSeg[i + 1]^carry);
+		carry = (sum & bitsToAdd->twoByteSeg[i + 1] | sum & carry | bitsToAdd->twoByteSeg[i + 1] & carry);
+	}*/
+	
+	
+	/*
+	My Solution
+	
+	struct pktBits *bitsToAdd = (struct pktBits*)&packet;	
+	uint16_t sum = bitsToAdd->twoByteSeg[0];
+
+	
+	outputfile << "(B) BitsToAdd part 0:";
+	outputfile << sum;
+	outputfile << "\n";
+	for (int i = 0; i < sizeof(bitsToAdd->twoByteSeg) - 1; i++) {
+		outputfile << "(B) BitsToAdd part ";
+		outputfile << i;
+		outputfile << ": ";
+		outputfile << bitsToAdd->twoByteSeg[i];
+		outputfile << "\n";
+		uint16_t next_seg = bitsToAdd->twoByteSeg[i + 1];
+		uint16_t prev_seg = sum;
+		uint16_t carry = 0;		
+		for (int j = 0; j < 16; j++) {
+			uint16_t s = (sum >> j) & 1;
+			uint16_t ns = (next_seg >> j) & 1;
+			uint16_t ps = (prev_seg >> j) & 1;
+			s = ((ns ^ ps) ^ carry); // sum
+			sum = sum | (s << j);
+			carry = ((ns & ps) | (ns & carry)) | (ps & carry); // carry
+		}
+		sum += carry;
+	}
+
+	~sum;
+	
+	End My Solution
+	
+	*/
+	//uint16_t b_checksum = sum; //changed this
+	
+	int sum = gen_crc16((uint8_t*)&packet, sizeof(packet));
+	
+	
+	/*outputfile << "Compare checksum from A: ";
+	outputfile << a_checksum;
+	outputfile << "\n";
+	outputfile << "Compare checksum from B: ";
+	outputfile << sum;
+	outputfile << "\n";
+	outputfile.close();*/
+	
+	if (!(a_checksum == sum)) {
+		//File is corrupted
+		return;
+	}
+	
+	else {
+		if (packet.seqnum == b_seqnum && packet.acknum == b_acknum) {//change made here
+			//this is the one we expected
+			if (b_seqnum == 0) { b_seqnum = 1;}
+			else { b_seqnum = 0;}
+		
+			if (b_acknum == 0) { b_acknum = 1;}
+			else { b_acknum = 0;}
+			
+			/*outputfile.open ("output_data.txt", std::ios_base::app);
+			outputfile << "Message successfully received, sending ack to A: \n";
+			outputfile.close();*/
+			
+			tolayer5(1, packet.payload);
+			tolayer3(1, packet);
+		}
+	}
+}
+
+/* the following rouytine will be called once (only) before any other */
+/* entity B routines are called. You can use it to do any initialization */
+void B_init() {
+	b_seqnum = 0;
+	b_acknum = 0;
+}
+
