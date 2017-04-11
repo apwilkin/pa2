@@ -29,20 +29,16 @@
 bool timeout = false;
 int timer_acknum = -1;
 int timer_seqnum = -1;
-int a_expected_seqnum = 0;
-int a_expected_acknum = 0;
-int b_expected_seqnum = 0;
-int b_expected_acknum = 0;
 int usn;
 int winsize;
-int winstart
-int timeout_int = 50;
+int winstart;
+int winend;
+int timeout_int = 100;
 float current_time;
 float start_time;
 
 struct timeoutStruct {
-	timeoutStruct(): intransit(false), timeout_value(get_sim_time() + timeout_int) {}
-	bool intransit;
+	timeoutStruct(): timeout_value(get_sim_time() + timeout_int) {}
 	float timeout_value;
 	pkt timeout_packet;
 };
@@ -104,14 +100,8 @@ uint16_t gen_crc16(const uint8_t *data, uint16_t size) {
 void A_output(struct msg message) {
 
 	// increment seq and ack nums
-	if (timer_seqnum == 2*winsize + 1) {
-		timer_seqnum = 0;
-		timer_acknum = 0;
-	}
-	else {
-		timer_seqnum++;
-		timer_acknum++;
-	}
+	timer_seqnum++;
+	timer_acknum++;
 	
 	// make packet
 	uint16_t checksum = 0;
@@ -126,20 +116,20 @@ void A_output(struct msg message) {
 	struct timeoutStruct newdata;
 	newdata.timeout_packet = packet;
 	
-	// if queue index(seqnum) is full add to pkt_queue
-	if ((timeout_queue[newdata.timeout_packet.seqnum]).intransit) {
+	// if seqnum outside window
+	if (timer_seqnum > winend) {
 		pkt_queue.push(newdata);
 	}
-	// else set intransit to true (need to set this to false when "popping")
-	// add to queue (by seqnum index) and send
+	// add to queue and send
 	else {
-		newdata.intransit = true;
-		timeout_queue[newdata.timeout_packet.seqnum] = newdata;
+		timeout_queue.push_back(newdata);
+		/*
 		outputfile.open ("output_data.txt", std::ios_base::app);
 		outputfile << "Data sent by A: ";
 		outputfile << *(newdata.timeout_packet.payload);
 		outputfile << "\n";
 		outputfile.close();
+		*/
 		tolayer3(0, newdata.timeout_packet);
 	}
 }
@@ -148,62 +138,82 @@ void A_output(struct msg message) {
 void A_input(struct pkt packet) {
 	outputfile.open ("output_data.txt", std::ios_base::app);
 	outputfile << "A input called\n";
-	if ((packet.seqnum == a_expected_seqnum) && (packet.acknum == a_expected_acknum)) {
-		(timeout_queue[packet.seqnum]).intransit = false;
-		outputfile << "Packet 'nullified': ";
-		outputfile << *((timeout_queue[packet.seqnum]).timeout_packet.payload);
+	
+	// checksum
+	uint16_t b_checksum = packet.checksum;
+	uint16_t reset = 0;
+	packet.checksum = reset;
+	int sum = gen_crc16((uint8_t*)&packet, sizeof(packet));	
+	if (!(b_checksum == sum)) {
+		//File is corrupted
+		return;
+	}
+	
+	// if this is winstart remove and increment winstart
+	if ((packet.seqnum == winstart)) {
+		// remove packed w/ seqnum
+		int i = -1;
+		bool notfound = true;
+		while (notfound) {
+			i++;
+			if (!(notfound < timeout_queue.size())) {
+				notfound = false;
+			}
+			else if (((timeout_queue[i]).timeout_packet).seqnum == winstart) {
+				timeout_queue.erase(timeout_queue.begin(), timeout_queue.begin() + i);
+				notfound = false;
+			}
+		}
+		winstart++;
+		winend = winstart + usn;
+		/*
+		outputfile << "Packet removed: ";
+		outputfile << *(packet.payload);
 		outputfile << "\n";
 		outputfile.close();
-		if (a_expected_seqnum == 2*winsize + 1) {
-			a_expected_seqnum = 0;
-			a_expected_acknum = 0;
-		}
-		else {
-			a_expected_seqnum++;
-			a_expected_acknum++;
-		}
+		*/
 	}
-	// if expected (timeout_queue[packet.seqnum]).inflight to false (increment usn(not on a side?) and expected?)
-	// while (rcv buffer contains next expected) { pop next expected;}
-	// refill/send all queued messages into the timeoutQueue?
+	// if not add to buffer
 	else {
 		arcv_buffer.push_back(packet);
 	}
-	
+	// loop through buffer to see if it contains the next expected
 	bool more_expected = true;
 	while (more_expected) {
 	more_expected = false;
 		for (int i = 0; i < arcv_buffer.size(); i++) {
-			if (arcv_buffer[i].seqnum == a_expected_seqnum) {
+			if (arcv_buffer[i].seqnum == winstart) {
 				more_expected = true;
-				if (timer_seqnum == 2*winsize + 1) {
-					a_expected_seqnum = 0;
-					a_expected_acknum = 0;
-				}
-				else {
-					a_expected_seqnum++;
-					a_expected_acknum++;
-				}
+				winstart++;
+				winend = winstart + usn;
 				arcv_buffer.erase(arcv_buffer.begin() + i);
 			}
 		}
 	}
-	
+	// refill/send all queued messages into the timeoutQueue?
+	while ((pkt_queue.front()).timeout_packet.seqnum <= winend) {
+		timeoutStruct temp = pkt_queue.front();
+		pkt_queue.pop();
+		temp.timeout_value = get_sim_time() + timeout_int;
+		timeout_queue.push_back(temp);
+		tolayer3(0, temp.timeout_packet);
+	}
 }
 
 /* called when A's timer goes off */
 void A_timerinterrupt() {
 	for (int i = 0; i < timeout_queue.size(); i++) {
-		if (timeout_queue[i].intransit) {
-			if (get_sim_time() >= (timeout_queue[i]).timeout_value) {
-				(timeout_queue[i]).timeout_value = get_sim_time() + timeout_int;
-				outputfile.open ("output_data.txt", std::ios_base::app);
-				outputfile << "Data resend by A: ";
-				outputfile << *(timeout_queue[i].timeout_packet.payload);
-				outputfile << "\n";
-				outputfile.close();
-				tolayer3(0, timeout_queue[i].timeout_packet);
-			}
+		// loop through timeout queue, if packet has timed out resend
+		if (get_sim_time() >= (timeout_queue[i]).timeout_value) {
+			(timeout_queue[i]).timeout_value = get_sim_time() + timeout_int;
+			/*
+			outputfile.open ("output_data.txt", std::ios_base::app);
+			outputfile << "Data resend by A: ";
+			outputfile << *(timeout_queue[i].timeout_packet.payload);
+			outputfile << "\n";
+			outputfile.close();
+			*/
+			tolayer3(0, timeout_queue[i].timeout_packet);
 		}
 	}
 	starttimer(0, 20);
@@ -216,14 +226,16 @@ void A_timerinterrupt() {
 /* the following routine will be called once (only) before any other */
 /* entity A routines are called. You can use it to do any initialization */
 void A_init() {
+	/*
 	outputfile.open ("output_data.txt");
 	outputfile << "~~~~~~~~~~~~~~~~~ A_init called ~~~~~~~~~~~~~~~~~~~~~~\n";
 	outputfile.close();
+	*/
 	start_time = get_sim_time();
 	winsize = getwinsize();
-	winstart = 0;
 	usn = 2*winsize + 1;
-	timeout_queue.resize(usn);
+	winstart = 0;
+	winend = winstart + usn;
 	starttimer(0, 20);
 }
 
@@ -231,6 +243,7 @@ void A_init() {
 
 /* called from layer 3, when a packet arrives for layer 4 at B*/
 void B_input(struct pkt packet) {
+	/*
 	outputfile.open ("output_data.txt", std::ios_base::app);
 	outputfile << "Data received by B: ";
 	outputfile << *packet.payload;
@@ -241,13 +254,11 @@ void B_input(struct pkt packet) {
 	outputfile << "Packet Acknum: ";
 	outputfile << packet.acknum;
 	outputfile << "\n";
-	outputfile << "Expected Seqnum: ";
-	outputfile << b_expected_seqnum;
-	outputfile << "\n";
-	outputfile << "Expected Acknum: ";
-	outputfile << b_expected_acknum;
+	outputfile << "Expected winstart: ";
+	outputfile << winstart;
 	outputfile << "\n";
 	outputfile.close();
+	*/
 	
 	uint16_t a_checksum = packet.checksum;
 	uint16_t reset = 0;
@@ -260,31 +271,27 @@ void B_input(struct pkt packet) {
 	}
 	
 	// if packet outside window return
-	if (packet.seqnum == usn) {
+	if (packet.seqnum > winend) {
+		/*
 		outputfile.open ("output_data.txt", std::ios_base::app);
 		outputfile << "Packet outside window! : ";
 		outputfile << *packet.payload;
 		outputfile << "\n";
 		outputfile.close();
+		*/
 		return;
 	}
 	// else if next expected send up
-	else if (packet.seqnum == b_expected_seqnum) {
+	else if (packet.seqnum == winstart) {
+		/*
 		outputfile.open ("output_data.txt", std::ios_base::app);
 		outputfile << "B sending packet back to A : ";
 		outputfile << *packet.payload;
 		outputfile << "\n";
 		outputfile.close();
-		if (timer_seqnum == 2*winsize + 1) {
-			b_expected_seqnum = 0;
-			b_expected_acknum = 0;
-			usn = 0;
-		}
-		else {
-			b_expected_seqnum++;
-			b_expected_acknum++;
-			usn++;
-		}
+		*/
+		winstart++;
+		winend = winstart + usn;
 		tolayer5(1, packet.payload);
 		tolayer3(1, packet);
 	}
@@ -297,21 +304,13 @@ void B_input(struct pkt packet) {
 	while (more_expected) {
 	more_expected = false;
 		for (int i = 0; i < brcv_buffer.size(); i++) {
-			if (brcv_buffer[i].seqnum == b_expected_seqnum) {
+			if (brcv_buffer[i].seqnum == winstart) {
 				more_expected = true;
-				if (timer_seqnum == 2*winsize + 1) {
-					b_expected_seqnum = 0;
-					b_expected_acknum = 0;
-					usn = 0;
-				}
-				else {
-					b_expected_seqnum++;
-					b_expected_acknum++;
-					usn++;
-				}
-				tolayer5(1, (arcv_buffer[i]).payload);
-				tolayer3(1, arcv_buffer[i]);
-				arcv_buffer.erase(arcv_buffer.begin() + i);
+				winstart++;
+				winend = winstart + usn;
+				tolayer5(1, (brcv_buffer[i]).payload);
+				tolayer3(1, brcv_buffer[i]);
+				brcv_buffer.erase(brcv_buffer.begin() + i);
 			}
 		}
 	}
@@ -322,6 +321,8 @@ void B_input(struct pkt packet) {
 void B_init() {
 	winsize = getwinsize();
 	usn = 2*winsize + 1;
+	winstart = 0;
+	winend = winstart + usn;
 }
 
 
